@@ -1,4 +1,6 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import type { Session } from "@supabase/supabase-js";
+import { supabase } from "./supabaseClient";
 
 const Card = ({ children }: { children: React.ReactNode }) => (
   <div
@@ -78,7 +80,6 @@ const CATEGORY_OPTIONS = [
   "Chefe de Equipa Multidisciplinar",
   "Dirigente",
 ] as const;
-const STORAGE_KEY = "siadap_workers_v1";
 
 type Worker = {
   id: string;
@@ -117,25 +118,6 @@ type CalcRow = {
   level: string;
   levelChangeDate: string;
 };
-
-function loadWorkersFromStorage(): Worker[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveWorkersToStorage(workers: Worker[]) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(workers));
-  } catch {}
-}
 
 function normalize(v: unknown): string {
   return v ? String(v).trim() : "";
@@ -237,7 +219,10 @@ function diffYMD(start: string): string {
     months += 12;
   }
 
-  return `${Math.max(0, years)}a ${Math.max(0, months)}m ${Math.max(0, days)}d`;
+  return `${Math.max(0, years)}a ${Math.max(0, months)}m ${Math.max(
+    0,
+    days
+  )}d`;
 }
 
 function formatProgressionDate(period: string): string {
@@ -404,8 +389,80 @@ function buildDecree75Report(workers: Worker[], periods: string[]) {
   });
 }
 
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value
+  );
+}
+
+function dbRowToWorker(row: any): Worker {
+  return {
+    id: row.id ?? `tmp-${Date.now()}`,
+    number: row.number ?? "",
+    name: row.name ?? "",
+    category: row.category ?? "Assistente Técnico",
+    level: row.level ?? "",
+    positionAt20230101: row.position_at_20230101 ?? "0",
+    currentPosition: row.current_position ?? "0",
+    initial: row.initial ?? 0,
+    points:
+      row.points && typeof row.points === "object"
+        ? row.points
+        : { "2023/2024": 0, "2025": 0 },
+    override: row.override && typeof row.override === "object" ? row.override : {},
+    levels: row.levels && typeof row.levels === "object" ? row.levels : {},
+    entryDate: row.entry_date ?? "",
+    entryEntityDate: row.entry_entity_date ?? "",
+    careerDate: row.career_date ?? "",
+    categoryDate: row.category_date ?? "",
+    levelChangeDate: row.level_change_date ?? "",
+    levelChangeDates:
+      row.level_change_dates && typeof row.level_change_dates === "object"
+        ? row.level_change_dates
+        : {},
+    exitDate: row.exit_date ?? "",
+    notes: row.notes ?? "",
+    usufruiu6: Boolean(row.usufruiu6),
+    dataUsufruto6: row.data_usufruto6 ?? "",
+  };
+}
+
+function workerToDbRow(worker: Worker, userId: string) {
+  return {
+    user_id: userId,
+    number: worker.number || null,
+    name: worker.name || null,
+    category: worker.category || null,
+    level: worker.level || null,
+    position_at_20230101: worker.positionAt20230101 || null,
+    current_position: worker.currentPosition || null,
+    initial: Number(worker.initial || 0),
+    points: worker.points || {},
+    override: worker.override || {},
+    levels: worker.levels || {},
+    entry_date: worker.entryDate || null,
+    entry_entity_date: worker.entryEntityDate || null,
+    career_date: worker.careerDate || null,
+    category_date: worker.categoryDate || null,
+    level_change_date: worker.levelChangeDate || null,
+    level_change_dates: worker.levelChangeDates || {},
+    exit_date: worker.exitDate || null,
+    notes: worker.notes || null,
+    usufruiu6: Boolean(worker.usufruiu6),
+    data_usufruto6: worker.dataUsufruto6 || null,
+  };
+}
+
 export default function App() {
-  const [workers, setWorkers] = useState<Worker[]>(loadWorkersFromStorage);
+  const [session, setSession] = useState<Session | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+
+  const [workers, setWorkers] = useState<Worker[]>([]);
+  const [workersLoading, setWorkersLoading] = useState(false);
   const [worker, setWorker] = useState<Worker>(createEmptyWorker());
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -433,53 +490,185 @@ export default function App() {
     (r) => r.elegivel && !r.used
   );
 
+  useEffect(() => {
+    let mounted = true;
+
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return;
+      if (error) {
+        setAuthError(error.message);
+      }
+      setSession(data.session ?? null);
+      setAuthReady(true);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  async function refreshWorkers(preferredWorkerId?: string) {
+    if (!session?.user?.id) return;
+
+    setWorkersLoading(true);
+
+    const { data, error } = await supabase
+      .from("workers")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      setWorkersLoading(false);
+      alert(`Erro ao carregar trabalhadores: ${error.message}`);
+      return;
+    }
+
+    const nextWorkers = (data || []).map(dbRowToWorker);
+    setWorkers(nextWorkers);
+
+    if (preferredWorkerId) {
+      const found = nextWorkers.find((w) => w.id === preferredWorkerId);
+      if (found) setWorker(found);
+    }
+
+    setWorkersLoading(false);
+  }
+
+  useEffect(() => {
+    if (!session?.user?.id) {
+      setWorkers([]);
+      setWorker(createEmptyWorker());
+      setWorkersLoading(false);
+      return;
+    }
+
+    refreshWorkers();
+  }, [session?.user?.id]);
+
+  async function handleLogin() {
+    setAuthError("");
+
+    if (!email.trim() || !password.trim()) {
+      setAuthError("Preencha o email e a palavra-passe.");
+      return;
+    }
+
+    setAuthBusy(true);
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password,
+    });
+
+    if (error) {
+      setAuthError("Não foi possível entrar. Confirma o email e a palavra-passe.");
+    }
+
+    setAuthBusy(false);
+  }
+
+  async function handleLogout() {
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      alert(`Erro ao terminar sessão: ${error.message}`);
+      return;
+    }
+    setWorker(createEmptyWorker());
+    setWorkers([]);
+    setSearchQuery("");
+    setEmail("");
+    setPassword("");
+  }
+
   function newWorker() {
     setWorker(createEmptyWorker());
   }
 
-  function saveCurrentWorker() {
-    const id = worker.id || worker.number || `tmp-${Date.now()}`;
+  async function saveCurrentWorker() {
+    if (!session?.user?.id) {
+      alert("Sessão inválida.");
+      return;
+    }
+
     const finalPosition =
       results[results.length - 1]?.final ||
       worker.currentPosition ||
       worker.positionAt20230101;
 
-    const stored: Worker = {
+    const preparedWorker: Worker = {
       ...worker,
-      id,
       currentPosition: finalPosition,
       level: currentLevel || worker.level,
     };
 
-    setWorker(stored);
+    const payload = workerToDbRow(preparedWorker, session.user.id);
 
-    setWorkers((prev) => {
-      const exists = prev.some((w) => w.id === id);
-      const nextWorkers = exists
-        ? prev.map((w) => (w.id === id ? stored : w))
-        : [stored, ...prev];
+    if (isUuid(worker.id)) {
+      const { data, error } = await supabase
+        .from("workers")
+        .update(payload)
+        .eq("id", worker.id)
+        .select()
+        .single();
 
-      saveWorkersToStorage(nextWorkers);
-      return nextWorkers;
-    });
+      if (error) {
+        alert(`Erro ao guardar trabalhador: ${error.message}`);
+        return;
+      }
+
+      const savedWorker = dbRowToWorker(data);
+      setWorker(savedWorker);
+      await refreshWorkers(savedWorker.id);
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("workers")
+      .insert([payload])
+      .select()
+      .single();
+
+    if (error) {
+      alert(`Erro ao guardar trabalhador: ${error.message}`);
+      return;
+    }
+
+    const savedWorker = dbRowToWorker(data);
+    setWorker(savedWorker);
+    await refreshWorkers(savedWorker.id);
   }
 
-  function deleteCurrentWorker() {
-    const exists = workers.some((w) => w.id === worker.id);
-
-    if (!exists) {
+  async function deleteCurrentWorker() {
+    if (!isUuid(worker.id)) {
       setWorker(createEmptyWorker());
       return;
     }
 
     const label = `${worker.number || "—"} | ${worker.name || "Sem nome"}`;
-    const confirmed = window.confirm(`Pretende apagar o trabalhador ${label}?`);
+    const confirmed = window.confirm(
+      `Pretende apagar o trabalhador ${label}?`
+    );
     if (!confirmed) return;
 
-    const nextWorkers = workers.filter((w) => w.id !== worker.id);
-    setWorkers(nextWorkers);
-    saveWorkersToStorage(nextWorkers);
+    const { error } = await supabase
+      .from("workers")
+      .delete()
+      .eq("id", worker.id);
+
+    if (error) {
+      alert(`Erro ao apagar trabalhador: ${error.message}`);
+      return;
+    }
+
     setWorker(createEmptyWorker());
+    await refreshWorkers();
   }
 
   function exportData() {
@@ -494,21 +683,48 @@ export default function App() {
   }
 
   function importData() {
+    if (!session?.user?.id) {
+      alert("Sessão inválida.");
+      return;
+    }
+
     const input = document.createElement("input");
     input.type = "file";
     input.accept = "application/json";
-    input.onchange = (e) => {
+    input.onchange = async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0];
       if (!file) return;
 
       const reader = new FileReader();
-      reader.onload = (ev) => {
+      reader.onload = async (ev) => {
         try {
           const parsed = JSON.parse(String(ev.target?.result || "{}"));
-          if (parsed.workers && Array.isArray(parsed.workers)) {
-            setWorkers(parsed.workers);
-            saveWorkersToStorage(parsed.workers);
+
+          if (!parsed.workers || !Array.isArray(parsed.workers)) {
+            alert("Ficheiro sem lista de trabalhadores.");
+            return;
           }
+
+          const payloads = parsed.workers.map((w: Worker) =>
+            workerToDbRow(
+              {
+                ...createEmptyWorker(),
+                ...w,
+                id: `tmp-${Date.now()}-${Math.random()}`,
+              },
+              session.user.id
+            )
+          );
+
+          const { error } = await supabase.from("workers").insert(payloads);
+
+          if (error) {
+            alert(`Erro ao importar ficheiro: ${error.message}`);
+            return;
+          }
+
+          await refreshWorkers();
+          alert("Importação concluída.");
         } catch {
           alert("Erro ao importar ficheiro");
         }
@@ -784,11 +1000,75 @@ export default function App() {
     );
   });
 
+  if (!authReady) {
+    return (
+      <div style={{ padding: 24, fontFamily: "Arial, sans-serif" }}>
+        A preparar a aplicação...
+      </div>
+    );
+  }
+
+  if (!session) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "#f1f5f9",
+          padding: 24,
+        }}
+      >
+        <Card>
+          <h3>Entrar na aplicação</h3>
+          <div style={{ display: "grid", gap: 10, minWidth: 320 }}>
+            <Input
+              type="email"
+              placeholder="Email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+            <Input
+              type="password"
+              placeholder="Palavra-passe"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            {authError ? (
+              <div style={{ color: "#b91c1c", fontSize: 14 }}>{authError}</div>
+            ) : null}
+            <Button onClick={handleLogin} disabled={authBusy}>
+              {authBusy ? "A entrar..." : "Entrar"}
+            </Button>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div style={{ padding: 20, background: "#f8fafc", minHeight: "100vh" }}>
       <Card>
-        <h3>Dados da aplicação</h3>
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 12,
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+          }}
+        >
+          <div>
+            <h3 style={{ margin: 0 }}>Dados da aplicação</h3>
+            <div style={{ fontSize: 13, color: "#555", marginTop: 6 }}>
+              Sessão iniciada: {session.user.email || "sem email"}
+            </div>
+          </div>
+          <Button onClick={handleLogout}>Terminar sessão</Button>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 16 }}>
           <Button onClick={newWorker}>Novo trabalhador</Button>
           <Button onClick={exportData}>Exportar</Button>
           <Button onClick={importData}>Importar</Button>
@@ -796,7 +1076,7 @@ export default function App() {
           <Button onClick={printDecree75Report}>DL 75/2023 PDF</Button>
           <Button
             onClick={() =>
-              alert(`${workers.length} trabalhador(es) em memória`)
+              alert(`${workers.length} trabalhador(es) deste utilizador`)
             }
           >
             Diagnóstico
@@ -814,8 +1094,10 @@ export default function App() {
           />
         </div>
 
-        {workers.length === 0 ? (
-          <div>Sem trabalhadores guardados.</div>
+        {workersLoading ? (
+          <div>A carregar trabalhadores...</div>
+        ) : workers.length === 0 ? (
+          <div>Sem trabalhadores guardados para este utilizador.</div>
         ) : (
           filteredWorkers.map((w) => {
             const computedWorker = getWorkerComputedState(w, periods);
@@ -1186,7 +1468,7 @@ export default function App() {
               <Field label="Pontos atribuídos">
                 <Input
                   type="number"
-                  value={worker.points[r.period]}
+                  value={worker.points[r.period] ?? 0}
                   onChange={(e) =>
                     setWorker({
                       ...worker,
